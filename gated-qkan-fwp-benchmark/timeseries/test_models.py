@@ -176,6 +176,32 @@ def test_gradients_match_reference():
     return worst
 
 
+def test_whitened_polynomial_readout():
+    """prepare() whitens the training features; the zero-initialised read-out predicts the mean."""
+    from math import comb
+
+    x_train, y_train, x_test, _ = protocol.load_torch("narma_10", 16)
+    for lags, degree in ((16, 1), (6, 2), (4, 3)):
+        model = models.build_model("whitened_poly", window=16, lags=lags, degree=degree)
+        model.prepare(x_train, y_train)
+        n_features = comb(lags + degree, degree) - 1
+        assert sum(p.numel() for p in model.parameters()) == n_features + 1
+        with torch.no_grad():
+            white = ((model.monomials(x_train) - model.feature_mean) @ model.whitening).double()
+            covariance = white.t() @ white / len(white)
+            kept = covariance.diagonal() > 0.5
+            assert kept.sum() >= 1
+            assert torch.allclose(covariance[kept][:, kept], torch.eye(int(kept.sum()), dtype=torch.float64), atol=5e-2)
+            prediction = model(x_test)
+        assert prediction.shape == (len(x_test),)
+        assert torch.allclose(prediction, y_train.mean().expand_as(prediction), atol=1e-6)
+    # explicit monomial check for degree 2 on two lags: a, b, a^2, ab, b^2
+    model = models.build_model("whitened_poly", window=16, lags=2, degree=2)
+    x = torch.rand(5, 16, 1)
+    a, b = x[:, -2, 0], x[:, -1, 0]
+    assert torch.allclose(model.monomials(x), torch.stack([a, b, a * a, a * b, b * b], dim=1))
+
+
 def steps_per_second(model, window, output, seconds=1.5):
     """Adam training steps per second at batch size 4 (the paper's batch size)."""
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)

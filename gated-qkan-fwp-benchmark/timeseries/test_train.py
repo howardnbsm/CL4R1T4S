@@ -89,6 +89,28 @@ def test_harness_follows_authors_training_trajectory():
     return worst
 
 
+def test_authors_modules_run_in_the_harness():
+    """The harness driving the authors' own module follows the same curve as our vectorised model,
+    and all four reference models are usable through the ``ref_*`` registry entries."""
+    worst = 0.0
+    ours = train.train_cell(train.TrainConfig(model="gqkan_qkanfwp", epochs=1), "bessel_j2", 8, 2)
+    theirs = train.train_cell(train.TrainConfig(model="ref_gqkan_qkanfwp", epochs=1), "bessel_j2", 8, 2)
+    assert theirs["params_effective"] == 159 and theirs["params_trainable"] == 195  # 36 unused fast-layer angles
+    for key in ("train_loss", "test_mse"):
+        rel = abs(ours["curve"][key][0] - theirs["curve"][key][0]) / theirs["curve"][key][0]
+        worst = max(worst, rel)
+        assert rel < 1e-4, (key, rel)
+    table2 = protocol.paper_param_counts()
+    x = torch.rand(4, 8, 1)
+    for name, paper_name in (("ref_gqkanfwp", "G-QKANFWP"), ("ref_gqkan_fwp", "GQKAN-FWP"), ("ref_gqkan_qfwp", "GQKAN-QFWP")):
+        model = models.build_model(name, window=8)
+        out = model(x)
+        assert out.shape == (4,)
+        out.sum().backward()
+        assert train.count_parameters(model)[1] == table2[paper_name], name
+    return worst
+
+
 def test_full_batch_eval_equals_batch4_eval():
     """Evaluating the test set in one batch gives the same metric as the authors' batches of 4."""
     worst = 0.0
@@ -166,13 +188,35 @@ def test_sweep_and_aggregate():
     shutil.rmtree(directory)
 
 
+def test_vmap_engine_matches_loop_engine():
+    """Training all seeds at once gives the same per-seed curves as training them one by one."""
+    worst = 0.0
+    cases = (
+        (train.TrainConfig(model="gqkan_qkanfwp", epochs=3), "narma_5", 8),  # 232 samples: ragged last batch
+        (train.TrainConfig(model="linear", epochs=4, batch_size=16, lr=1e-2, optimizer="adamw", weight_decay=1e-3,
+                           scheduler="cosine", warmup_epochs=1.0, grad_clip=0.05, shuffle="simple"), "damped_shm", 16),
+    )
+    for config, dataset, window in cases:
+        seeds = [0, 1, 2]
+        together = train.train_cells_vmap(config, dataset, window, seeds)
+        for seed, batched in zip(seeds, together):
+            single = train.train_cell(config, dataset, window, seed)
+            assert batched["seed"] == seed and batched["params_effective"] == single["params_effective"]
+            for key in ("train_loss", "test_mse"):
+                for a, b in zip(batched["curve"][key], single["curve"][key]):
+                    rel = abs(a - b) / b
+                    worst = max(worst, rel)
+                    assert rel < 1e-3, (config.model, seed, key, a, b)
+    return worst
+
+
 def test_win_criterion_uses_paper_precision():
-    assert train.compare_with_paper(1.062e-05, 0.000011) == "tie"  # same number after rounding
-    assert train.compare_with_paper(1.04e-05, 0.000011) == "WIN"
-    assert train.compare_with_paper(1.16e-05, 0.000011) == "lose"
-    assert train.compare_with_paper(1.6e-06, 0.000002) == "tie"
-    assert train.compare_with_paper(1.4e-06, 0.000002) == "WIN"
-    assert train.compare_with_paper(float("nan"), 0.000002) == "lose"
+    assert protocol.compare_with_paper(1.062e-05, 0.000011) == "tie"  # same number after rounding
+    assert protocol.compare_with_paper(1.04e-05, 0.000011) == "WIN"
+    assert protocol.compare_with_paper(1.16e-05, 0.000011) == "lose"
+    assert protocol.compare_with_paper(1.6e-06, 0.000002) == "tie"
+    assert protocol.compare_with_paper(1.4e-06, 0.000002) == "WIN"
+    assert protocol.compare_with_paper(float("nan"), 0.000002) == "lose"
 
 
 if __name__ == "__main__":

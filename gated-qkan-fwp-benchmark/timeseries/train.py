@@ -60,6 +60,7 @@ class TrainConfig:
     weight_decay: float = 0.0
     beta1: float = 0.9
     beta2: float = 0.999
+    adam_eps: float = 1e-8  # adam / adamw epsilon
     momentum: float = 0.0  # sgd / rmsprop
     scheduler: str = "none"  # none | cosine | linear | exponential
     warmup_epochs: float = 0.0  # linear warm-up from 0, in epochs (may be fractional)
@@ -72,46 +73,50 @@ class TrainConfig:
         return (self.epochs == protocol.PAPER_EPOCHS and self.batch_size == protocol.PAPER_BATCH_SIZE
                 and self.lr == protocol.PAPER_LR and self.optimizer == "adam" and self.scheduler == "none"
                 and self.weight_decay == 0.0 and self.warmup_epochs == 0.0 and self.grad_clip == 0.0
-                and (self.beta1, self.beta2) == (0.9, 0.999))
+                and (self.beta1, self.beta2, self.adam_eps) == (0.9, 0.999, 1e-8))
 
 
 # ------------------------------------------------------------------ mini-batch order
-def _draw_global_int64() -> int:
-    """One 64-bit draw from torch's global RNG, as DataLoader / RandomSampler do."""
-    return int(torch.empty((), dtype=torch.int64).random_().item())
+def _draw_int64(generator=None) -> int:
+    """One 64-bit draw, as DataLoader / RandomSampler do (global RNG when ``generator`` is None)."""
+    return int(torch.empty((), dtype=torch.int64).random_(generator=generator).item())
 
 
 class BatchOrder:
     """Yields the training permutation of every epoch.
 
-    ``reference``  replays the global-RNG usage of the authors' trainer: per epoch the
-                   train DataLoader draws an iterator seed and its RandomSampler a
-                   permutation seed; the test DataLoader (and, at epochs 1/15/30/50/100,
-                   the prediction-dump DataLoader) draw one iterator seed each.
+    ``reference``  replays the RNG usage of the authors' trainer: per epoch the train
+                   DataLoader draws an iterator seed and its RandomSampler a permutation
+                   seed; the test DataLoader (and, at epochs 1/15/30/50/100, the
+                   prediction-dump DataLoader) draw one iterator seed each.  The draws
+                   come from torch's global RNG, or from ``reference_stream`` when given
+                   (a private generator that continues a seed's global stream, used when
+                   several seeds are trained at once).
     ``simple``     ``torch.randperm`` from a private generator seeded with the run seed.
     ``none``       no shuffling.
     """
 
-    def __init__(self, mode: str, n: int, seed: int):
+    def __init__(self, mode: str, n: int, seed: int, reference_stream: torch.Generator | None = None):
         if mode not in ("reference", "simple", "none"):
             raise ValueError(f"unknown shuffle mode {mode!r}")
         self.mode, self.n = mode, n
         self.generator = torch.Generator().manual_seed(seed)
+        self.reference_stream = reference_stream
 
     def train_permutation(self) -> torch.Tensor:
         if self.mode == "none":
             return torch.arange(self.n)
         if self.mode == "simple":
             return torch.randperm(self.n, generator=self.generator)
-        _draw_global_int64()  # train DataLoader iterator seed
-        sampler_generator = torch.Generator().manual_seed(_draw_global_int64())  # RandomSampler seed
-        return torch.randperm(self.n, generator=sampler_generator)
+        _draw_int64(self.reference_stream)  # train DataLoader iterator seed
+        sampler_seed = _draw_int64(self.reference_stream)  # RandomSampler seed
+        return torch.randperm(self.n, generator=torch.Generator().manual_seed(sampler_seed))
 
     def after_epoch(self, epoch: int) -> None:
         if self.mode == "reference":
-            _draw_global_int64()  # test DataLoader iterator seed
+            _draw_int64(self.reference_stream)  # test DataLoader iterator seed
             if epoch in _REFERENCE_PREDICTION_EPOCHS:
-                _draw_global_int64()  # prediction-dump DataLoader iterator seed
+                _draw_int64(self.reference_stream)  # prediction-dump DataLoader iterator seed
 
 
 # ------------------------------------------------------------ optimiser and schedule
@@ -119,10 +124,10 @@ def make_optimizer(config: TrainConfig, parameters):
     name = config.optimizer
     if name == "adam":
         return torch.optim.Adam(parameters, lr=config.lr, betas=(config.beta1, config.beta2),
-                                weight_decay=config.weight_decay)
+                                eps=config.adam_eps, weight_decay=config.weight_decay)
     if name == "adamw":
         return torch.optim.AdamW(parameters, lr=config.lr, betas=(config.beta1, config.beta2),
-                                 weight_decay=config.weight_decay)
+                                 eps=config.adam_eps, weight_decay=config.weight_decay)
     if name == "sgd":
         return torch.optim.SGD(parameters, lr=config.lr, momentum=config.momentum,
                                weight_decay=config.weight_decay)
@@ -238,19 +243,131 @@ def train_cell(config: TrainConfig, dataset: str, window: int, seed: int, verbos
         if not math.isfinite(train_loss):
             break  # diverged: the remaining epochs cannot recover a finite metric
     seconds = time.perf_counter() - start
+    return _result_record(config, dataset, window, seed, "loop", n_train, len(y_test_np), params_trainable,
+                          params_effective, curve, seconds, step / seconds)
 
+
+def _result_record(config, dataset, window, seed, engine, n_train, n_test, params_trainable, params_effective,
+                   curve, seconds, steps_per_second) -> dict:
     finished = len(curve["epoch"]) == config.epochs
     return {
-        "dataset": dataset, "window": window, "seed": seed, "config": asdict(config),
+        "dataset": dataset, "window": window, "seed": seed, "config": asdict(config), "engine": engine,
         "follows_paper_recipe": config.follows_paper_recipe(),
         "is_paper_cell": protocol.is_paper_cell(dataset, window),
-        "n_train": n_train, "n_test": len(y_test_np),
+        "n_train": n_train, "n_test": n_test,
         "params_trainable": params_trainable, "params_effective": params_effective,
         "final_test_mse": curve["test_mse"][-1] if finished else float("nan"),
         "final_train_loss": curve["train_loss"][-1],
         "min_test_mse_any_epoch_DIAGNOSTIC_ONLY": float(np.nanmin(curve["test_mse"])),
-        "curve": curve, "seconds": seconds, "steps_per_second": step / seconds,
+        "curve": curve, "seconds": seconds, "steps_per_second": steps_per_second,
     }
+
+
+def train_cells_vmap(config: TrainConfig, dataset: str, window: int, seeds) -> list[dict]:
+    """Train several seeds of one (dataset, window) cell at once with ``torch.func.vmap``.
+
+    Mathematically the same as calling ``train_cell`` per seed: every seed keeps its own
+    initial weights and its own mini-batch order, and the optimiser acts element-wise on the
+    seed-stacked parameters, so the seeds never interact.  It is faster because the python /
+    autograd overhead of a step is shared by all seeds.  Requirements: the model's forward
+    must be vmap-compatible (no data-dependent python control flow, no BatchNorm) and must
+    not draw random numbers; the optimiser must be element-wise (not lbfgs).
+    """
+    from torch.func import functional_call, grad_and_value, vmap
+
+    if config.optimizer == "lbfgs":
+        raise ValueError("the vmap engine does not support lbfgs; use the loop engine")
+    x_train, y_train, x_test, y_test = protocol.load_torch(dataset, window)
+    y_test_np = y_test.numpy()
+    n_train, n_seeds = len(y_train), len(seeds)
+
+    nets, orders = [], []
+    for seed in seeds:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        net = models.build_model(config.model, window, **config.model_kwargs)
+        if hasattr(net, "prepare"):
+            net.prepare(x_train, y_train)  # training split only
+        nets.append(net)
+        stream = torch.Generator()
+        stream.set_state(torch.get_rng_state())  # continue this seed's global RNG stream privately
+        orders.append(BatchOrder(config.shuffle, n_train, seed, reference_stream=stream))
+    base = nets[0]
+    # parameter counts from one ordinary backward pass (grad of unused parameters stays None)
+    F.mse_loss(base(x_train[:4]), y_train[:4]).backward()
+    params_trainable, params_effective = count_parameters(base)
+    base.zero_grad()
+
+    def stack(name_to_tensor_per_net, trainable):
+        return {name: torch.stack([tensors[name].detach() for tensors in name_to_tensor_per_net]).requires_grad_(trainable)
+                for name in name_to_tensor_per_net[0]}
+
+    trainable = stack([{n: p for n, p in net.named_parameters() if p.requires_grad} for net in nets], True)
+    # Non-trainable tensors: those equal for all seeds (e.g. constants fitted by prepare()) are
+    # shared as they are; only the ones that differ between seeds get a seed dimension.
+    constants = [{**{n: p for n, p in net.named_parameters() if not p.requires_grad}, **dict(net.named_buffers())}
+                 for net in nets]
+    shared = {n: t.detach() for n, t in constants[0].items() if all(torch.equal(t, c[n]) for c in constants)}
+    frozen = stack([{n: t for n, t in c.items() if n not in shared} for c in constants], False)
+
+    def forward_one_seed(weights, fixed, x):
+        return functional_call(base, {**weights, **fixed, **shared}, (x,))
+
+    def loss_of_one_seed(weights, fixed, x, y):
+        prediction = forward_one_seed(weights, fixed, x)
+        if prediction.shape != y.shape:
+            raise ValueError(f"model must return shape (B,), got {tuple(prediction.shape)}")
+        return F.mse_loss(prediction, y)
+
+    grads_and_losses = vmap(grad_and_value(loss_of_one_seed))
+    predict_all_seeds = vmap(forward_one_seed, in_dims=(0, 0, None))
+    optimizer = make_optimizer(config, list(trainable.values()))
+
+    batch_size = config.batch_size if config.batch_size > 0 else n_train
+    steps_per_epoch = math.ceil(n_train / batch_size)
+    total_steps = steps_per_epoch * config.epochs
+    scheduled = config.scheduler != "none" or config.warmup_epochs > 0
+    curves = [{"epoch": [], "train_loss": [], "test_mse": []} for _ in seeds]
+    alive = [True] * n_seeds  # a diverged seed stops being recorded, like the loop engine
+    step = 0
+    start = time.perf_counter()
+    for epoch in range(1, config.epochs + 1):
+        base.train()
+        permutations = torch.stack([order.train_permutation() for order in orders])  # (seeds, n_train)
+        running = torch.zeros(n_seeds, dtype=torch.float64)
+        for first in range(0, n_train, batch_size):
+            index = permutations[:, first:first + batch_size]
+            if scheduled:
+                factor = lr_factor(config, step, total_steps, steps_per_epoch)
+                for group in optimizer.param_groups:
+                    group["lr"] = config.lr * factor
+            with torch.no_grad():  # the inner grad transform is unaffected by the outer no_grad
+                grads, losses = grads_and_losses(trainable, frozen, x_train[index], y_train[index])
+                if config.grad_clip > 0:  # per-seed global gradient norm, as clip_grad_norm_ per model
+                    squared = sum(g.reshape(n_seeds, -1).pow(2).sum(dim=1) for g in grads.values())
+                    scale = (config.grad_clip / (squared.sqrt() + 1e-6)).clamp(max=1.0)
+                    grads = {n: g * scale.view(-1, *[1] * (g.dim() - 1)) for n, g in grads.items()}
+            for name, parameter in trainable.items():
+                parameter.grad = grads[name]
+            optimizer.step()
+            running += losses.double() * index.shape[1]
+            step += 1
+        base.eval()
+        with torch.no_grad():
+            predictions = predict_all_seeds(trainable, frozen, x_test).numpy()
+        for i, order in enumerate(orders):
+            order.after_epoch(epoch)
+            if not alive[i]:
+                continue
+            train_loss = running[i].item() / n_train
+            curves[i]["epoch"].append(epoch)
+            curves[i]["train_loss"].append(train_loss)
+            curves[i]["test_mse"].append(protocol.test_mse(predictions[i], y_test_np))  # the paper's metric
+            alive[i] = math.isfinite(train_loss)
+    seconds = time.perf_counter() - start
+    return [_result_record(config, dataset, window, seed, "vmap", n_train, len(y_test_np), params_trainable,
+                           params_effective, curves[i], seconds / n_seeds, step * n_seeds / seconds)
+            for i, seed in enumerate(seeds)]
 
 
 # --------------------------------------------------------------------------- sweeps
@@ -262,65 +379,76 @@ def cell_path(tag: str, dataset: str, window: int, seed: int) -> Path:
     return tag_dir(tag) / "cells" / f"{dataset}_w{window}_s{seed}.json"
 
 
-def _run_one(job):
-    """Worker: train one cell, write its JSON, return a one-line summary."""
-    tag, config, dataset, window, seed = job
-    torch.set_num_threads(1)
-    result = train_cell(config, dataset, window, seed)
+def _write_cell(tag: str, result: dict) -> str:
+    """Store one cell record and return a one-line summary."""
     result["tag"] = tag
-    path = cell_path(tag, dataset, window, seed)
+    path = cell_path(tag, result["dataset"], result["window"], result["seed"])
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(result, f)
+    tmp.write_text(json.dumps(result))
     tmp.rename(path)
-    return (f"{dataset:24s} w{window:<3d} seed {seed}  final test MSE {result['final_test_mse']:.3e}  "
-            f"params {result['params_effective']}  {result['seconds']:.1f}s "
-            f"({result['steps_per_second']:.0f} steps/s)")
+    return (f"{result['dataset']:24s} w{result['window']:<3d} seed {result['seed']}  "
+            f"final test MSE {result['final_test_mse']:.3e}  params {result['params_effective']}  "
+            f"{result['seconds']:.1f}s ({result['steps_per_second']:.0f} steps/s)")
 
 
-def run_sweep(tag: str, config: TrainConfig, datasets, windows, seeds, jobs: int = 1, force: bool = False):
-    """Train all missing cells of a sweep (resumable) and return the list of cell files."""
+def _run_job(job) -> list[str]:
+    """Worker: train the seeds of one (dataset, window) group and write their JSON files."""
+    tag, config, dataset, window, seeds, engine = job
+    torch.set_num_threads(1)
+    if engine == "vmap":
+        results = train_cells_vmap(config, dataset, window, seeds)
+    else:
+        results = [train_cell(config, dataset, window, seed) for seed in seeds]
+    return [_write_cell(tag, result) for result in results]
+
+
+def run_sweep(tag: str, config: TrainConfig, datasets, windows, seeds, jobs: int = 1, force: bool = False,
+              engine: str = "loop"):
+    """Train all missing cells of a sweep (resumable).
+
+    ``engine`` "loop" trains one seed at a time (works for every model); "vmap" trains all
+    seeds of a (dataset, window) cell together (see ``train_cells_vmap``).
+    """
+    if engine not in ("loop", "vmap"):
+        raise ValueError(f"unknown engine {engine!r}")
     directory = tag_dir(tag)
     directory.mkdir(parents=True, exist_ok=True)
     config_file = directory / "config.json"
     if config_file.exists() and not force:
-        stored = json.loads(config_file.read_text())
+        try:  # options added to TrainConfig after the tag was created take their default value
+            stored = asdict(TrainConfig(**json.loads(config_file.read_text())))
+        except TypeError:
+            stored = None
         if stored != asdict(config):
             raise SystemExit(f"tag {tag!r} already holds results for a different configuration "
                              f"({config_file}); use another --tag or --force")
     config_file.write_text(json.dumps(asdict(config), indent=2))
 
-    todo = [(tag, config, d, w, s) for d in datasets for w in windows for s in seeds
-            if force or not cell_path(tag, d, w, s).exists()]
-    print(f"[{tag}] {len(todo)} cells to train ({config.model}, {jobs} job(s))", flush=True)
+    todo = []
+    for dataset in datasets:
+        for window in windows:
+            missing = [s for s in seeds if force or not cell_path(tag, dataset, window, s).exists()]
+            if missing and engine == "vmap":
+                todo.append((tag, config, dataset, window, missing, engine))
+            else:
+                todo += [(tag, config, dataset, window, [s], engine) for s in missing]
+    n_cells = sum(len(job[4]) for job in todo)
+    print(f"[{tag}] {n_cells} cells to train ({config.model}, engine {engine}, {jobs} job(s))", flush=True)
     start = time.time()
     if jobs <= 1:
         for job in todo:
-            print("  " + _run_one(job), flush=True)
+            for line in _run_job(job):
+                print("  " + line, flush=True)
     else:
         import multiprocessing
 
         todo.sort(key=lambda job: -protocol.load(job[2], job[3])[0].size)  # longest cells first
         with multiprocessing.get_context("fork").Pool(jobs) as pool:
-            for line in pool.imap_unordered(_run_one, todo):
-                print("  " + line, flush=True)
+            for lines in pool.imap_unordered(_run_job, todo):
+                for line in lines:
+                    print("  " + line, flush=True)
     print(f"[{tag}] done in {time.time() - start:.0f}s", flush=True)
-
-
-def compare_with_paper(mean: float, paper_value: float) -> str:
-    """WIN / tie / lose at the paper's printed precision (6 decimals).
-
-    The paper prints means rounded to 1e-6, so a mean is only counted as a win if it is
-    still lower after the same rounding; equal after rounding is a tie (e.g. the same
-    model reproducing the paper's number).
-    """
-    if not np.isfinite(mean):
-        return "lose"
-    rounded = round(mean, 6)
-    if rounded < paper_value - 1e-12:
-        return "WIN"
-    return "tie" if abs(rounded - paper_value) <= 1e-12 else "lose"
 
 
 def load_cells(tag: str) -> list[dict]:
@@ -359,7 +487,7 @@ def aggregate(tag: str, paper_model: str | None = None, write: bool = True) -> d
         line = f"| {dataset} | {window} | {len(group)} | {row['params_effective']} | {mean:.3e} ± {std:.3e} |"
         if protocol.is_paper_cell(dataset, window):
             best = protocol.paper_best(dataset, window)
-            verdict = compare_with_paper(mean, best)
+            verdict = protocol.compare_with_paper(mean, best)
             targets += 1
             wins += verdict == "WIN"
             row.update(paper_best=best, paper_best_model=protocol.paper_best_model(dataset, window),
@@ -404,11 +532,14 @@ def build_parser():
     defaults = TrainConfig()
     for name in ("epochs", "batch_size"):
         run.add_argument(f"--{name}", type=int, default=getattr(defaults, name))
-    for name in ("lr", "weight_decay", "beta1", "beta2", "momentum", "warmup_epochs", "final_lr_ratio", "grad_clip"):
+    for name in ("lr", "weight_decay", "beta1", "beta2", "adam_eps", "momentum", "warmup_epochs", "final_lr_ratio",
+                 "grad_clip"):
         run.add_argument(f"--{name}", type=float, default=getattr(defaults, name))
     run.add_argument("--optimizer", default=defaults.optimizer, choices=["adam", "adamw", "sgd", "rmsprop", "lbfgs"])
     run.add_argument("--scheduler", default=defaults.scheduler, choices=["none", "cosine", "linear", "exponential"])
     run.add_argument("--shuffle", default=defaults.shuffle, choices=["reference", "simple", "none"])
+    run.add_argument("--engine", default="loop", choices=["loop", "vmap"],
+                     help="loop: one seed at a time (any model); vmap: all seeds of a cell at once (faster)")
     run.add_argument("--jobs", type=int, default=1, help="worker processes (machine rule: at most 2)")
     run.add_argument("--force", action="store_true", help="retrain cells that already have results")
     run.add_argument("--paper-model", default=None, help="also show this paper model's row, e.g. GQKAN-QKANFWP")
@@ -431,10 +562,12 @@ def main(argv=None):
         config = TrainConfig(
             model=args.model, model_kwargs=json.loads(args.model_kwargs), epochs=args.epochs,
             batch_size=args.batch_size, lr=args.lr, optimizer=args.optimizer, weight_decay=args.weight_decay,
-            beta1=args.beta1, beta2=args.beta2, momentum=args.momentum, scheduler=args.scheduler,
+            beta1=args.beta1, beta2=args.beta2, adam_eps=args.adam_eps, momentum=args.momentum,
+            scheduler=args.scheduler,
             warmup_epochs=args.warmup_epochs, final_lr_ratio=args.final_lr_ratio, grad_clip=args.grad_clip,
             shuffle=args.shuffle)
-        run_sweep(args.tag, config, args.datasets, args.windows, args.seeds, jobs=args.jobs, force=args.force)
+        run_sweep(args.tag, config, args.datasets, args.windows, args.seeds, jobs=args.jobs, force=args.force,
+                  engine=args.engine)
     aggregate(args.tag, paper_model=args.paper_model)
 
 

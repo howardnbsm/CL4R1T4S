@@ -202,6 +202,21 @@ def paper_best_model(dataset: str, window: int) -> str:
     return min(results, key=lambda m: results[m][0])
 
 
+def compare_with_paper(mean: float, paper_value: float) -> str:
+    """"WIN" / "tie" / "lose" at the paper's printed precision (6 decimals).
+
+    The paper prints means rounded to 1e-6, so a mean only counts as a win if it is still
+    lower after the same rounding; equal after rounding is a tie (e.g. the same model
+    reproducing the paper's number).
+    """
+    if not np.isfinite(mean):
+        return "lose"
+    rounded = round(float(mean), 6)
+    if rounded < paper_value - 1e-12:
+        return "WIN"
+    return "tie" if abs(rounded - paper_value) <= 1e-12 else "lose"
+
+
 def paper_param_counts() -> dict:
     """Table 2 trainable-parameter counts of the paper's time-series models."""
     return dict(paper_targets()["param_counts_table2"]["time_series"])

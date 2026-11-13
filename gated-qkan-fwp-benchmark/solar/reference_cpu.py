@@ -125,7 +125,16 @@ def _epoch_seconds(log_path: Path) -> list:
 
 
 def run(seed: int, epochs: int, impl: str, out_dir: Path, threads: int = 1,
-        dropout_stream: int | None = None, overwrite: bool = False) -> dict:
+        dropout_stream: int | None = None, final_eval_split: str = "test",
+        overwrite: bool = False) -> dict:
+    """Run the reference trainer once and return a summary of what it wrote.
+
+    ``final_eval_split="val"`` hands the validation loader to the trainer in
+    place of the test loader, so that probe runs (anchors, timing) never touch
+    the test split; reproduction runs use the default ``"test"``.
+    """
+    if final_eval_split not in ("test", "val"):
+        raise ValueError(final_eval_split)
     torch.set_num_threads(threads)
     out_dir = Path(out_dir).resolve()
     if out_dir.exists() and any(out_dir.iterdir()):
@@ -143,17 +152,19 @@ def run(seed: int, epochs: int, impl: str, out_dir: Path, threads: int = 1,
     # ---- reference train.py main(), same order ----
     seed_everything(args.seed)
     (out_dir / "args.json").write_text(json.dumps(
-        {**vars(args), "impl": impl, "threads": threads, "dropout_stream": dropout_stream},
-        indent=4, sort_keys=True))
+        {**vars(args), "impl": impl, "threads": threads, "dropout_stream": dropout_stream,
+         "final_eval_split": final_eval_split}, indent=4, sort_keys=True))
     logger = ref.setup_logger(out_dir / "log.txt")
     dataset_bundle = ref.make_datasets(args)
     loaders = ref.make_loaders(args, dataset_bundle)
+    if final_eval_split == "val":
+        loaders.test_loader = loaders.val_loader  # probe run: keep the test split sealed
     model = cpu_backend.build_model(args, impl=impl)
     if dropout_stream is not None:
         model.dropout = _PrivateStreamDropout(model.dropout.p, dropout_stream)
 
     print(f"[reference_cpu] seed={seed} epochs={epochs} impl={impl} threads={torch.get_num_threads()} "
-          f"model={type(model).__name__} out_dir={out_dir}", flush=True)
+          f"model={type(model).__name__} final_eval_split={final_eval_split} out_dir={out_dir}", flush=True)
     (out_dir / "STATUS").write_text("running\n")
     t0 = time.time()
     ref.run_training(args=args, model=model, loaders=loaders, result_path=out_dir, logger=logger)
@@ -169,7 +180,8 @@ def run(seed: int, epochs: int, impl: str, out_dir: Path, threads: int = 1,
     summary = {
         "seed": seed, "epochs": epochs, "impl": impl, "threads": threads, "dropout_stream": dropout_stream,
         "trainable_parameters": int(row["trainable_parameters"]),
-        "test": {
+        "final_eval_split": final_eval_split,
+        "final_eval": {
             "scaled_mse": float(row["scaled_mse"]), "scaled_mae": float(row["scaled_mae"]),
             "scaled_rmse": float(row["scaled_rmse"]), "scaled_r2": float(row["scaled_r2"]),
             "pae": float(row["peak_error"]), "pte": float(row["timing_error"]),
@@ -189,15 +201,18 @@ def run(seed: int, epochs: int, impl: str, out_dir: Path, threads: int = 1,
     (out_dir / "final_metrics.json").write_text(json.dumps(summary, indent=2))
     (out_dir / "STATUS").write_text("done\n")
 
-    protocol.log_external_test_evaluation(
-        tag=f"AUTHORS-MODEL reference trainer: seed={seed} epochs={epochs} impl={impl}"
-            + (f" dropout_stream={dropout_stream}" if dropout_stream is not None else ""),
-        metrics=summary["test"],
-        note=f"final evaluation of the authors' model by the reference run_training; out_dir={out_dir}",
-    )
-    print(f"[reference_cpu] done in {wall:.1f}s  best val {summary['best_val_loss']:.6f} "
-          f"@ epoch {summary['best_val_epoch']}  test scaled MSE {summary['test']['scaled_mse']:.6f} "
-          f"PAE {summary['test']['pae']:.2f} PTE {summary['test']['pte']:.2f}", flush=True)
+    if final_eval_split == "test":
+        protocol.log_external_test_evaluation(
+            tag=f"AUTHORS-MODEL reference trainer: seed={seed} epochs={epochs} impl={impl}"
+                + (f" dropout_stream={dropout_stream}" if dropout_stream is not None else ""),
+            metrics=summary["final_eval"],
+            note=f"final evaluation of the authors' model by the reference run_training; out_dir={out_dir}",
+        )
+    final = summary["final_eval"]
+    print(f"[reference_cpu] done in {wall:.1f}s  epoch-1 train {summary['epoch1_train_loss']:.6f} "
+          f"val {summary['epoch1_val_loss']:.6f}  best val {summary['best_val_loss']:.6f} "
+          f"@ epoch {summary['best_val_epoch']}  final eval on {final_eval_split}: "
+          f"scaled MSE {final['scaled_mse']:.6f} PAE {final['pae']:.2f} PTE {final['pte']:.2f}", flush=True)
     return summary
 
 
@@ -213,12 +228,16 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--dropout_stream", type=int, default=None,
                         help="anchor probe only: draw dropout masks from a private generator with this seed")
+    parser.add_argument("--final_eval_split", choices=["test", "val"], default="test",
+                        help="val: probe run, the trainer's final evaluation uses the validation "
+                             "windows and the test split stays sealed")
     parser.add_argument("--overwrite", action="store_true")
     cli = parser.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
     out_dir = cli.out_dir if cli.out_dir is not None else DEFAULT_OUT_ROOT / f"seed{cli.seed}"
     run(cli.seed, cli.epochs, cli.impl, out_dir, threads=cli.threads,
-        dropout_stream=cli.dropout_stream, overwrite=cli.overwrite)
+        dropout_stream=cli.dropout_stream, final_eval_split=cli.final_eval_split,
+        overwrite=cli.overwrite)
 
 
 if __name__ == "__main__":

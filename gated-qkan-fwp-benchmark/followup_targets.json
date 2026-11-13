@@ -1,0 +1,14 @@
+{
+  "source": "arXiv:2607.27945 (Complementary Matrix-Gated QKAN Fast-Weight Programmers), Tables II-V, as transcribed by our literature scout; best arm per cell",
+  "protocol_differences_vs_v1": "100 epochs (v1: 50); 209-306 parameters (v1: 100-159); otherwise the same six datasets, scaling, 80/20 split, batch 4, Adam 1e-3, 5 seeds, final-epoch test MSE",
+  "use": "secondary target: strongest published numbers in the QKAN-FWP family on v1's time-series benchmark",
+  "windows": [8, 16, 32, 64],
+  "best_per_cell": {
+    "bessel_j2": [8.73e-6, 4.94e-6, 2.90e-6, 6.37e-6],
+    "damped_shm": [1.17e-5, 1.42e-5, 3.60e-6, 1.00e-5],
+    "narma_5": [4.91e-6, 5.21e-6, 7.13e-6, 9.58e-6],
+    "narma_10": [2.25e-5, 2.55e-6, 1.33e-5, 1.36e-5],
+    "delayed_quantum_control": [3.52e-6, 6.94e-6, 7.82e-6, 4.77e-6],
+    "jaynes_cummings": [1.66e-5, 3.18e-6, 9.10e-6, 7.04e-6]
+  }
+}

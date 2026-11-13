@@ -242,17 +242,118 @@ for _flag in ("gqkan_qkanfwp", "gqkanfwp", "gqkan_fwp", "gqkan_qfwp"):
     register(f"ref_{_flag}")(_reference_factory(_flag))
 
 
-# --------------------------------------------------------------- minimal example
+# -------------------------------------------------------------- minimal examples
+class LinearWindow(nn.Module):
+    """Linear read-out of the raw window (N + 1 parameters)."""
+
+    def __init__(self, window: int):
+        super().__init__()
+        self.readout = nn.Linear(window, 1)
+
+    def forward(self, x):
+        return self.readout(x.squeeze(-1)).squeeze(-1)
+
+
 @register("linear")
 def _linear(window: int) -> nn.Module:
     """Linear read-out of the raw window (N + 1 parameters); the simplest possible entry."""
+    return LinearWindow(window)
 
-    class LinearWindow(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.readout = nn.Linear(window, 1)
 
-        def forward(self, x):
-            return self.readout(x.squeeze(-1)).squeeze(-1)
+class RidgeInitLinear(LinearWindow):
+    """``LinearWindow`` whose weights start at the closed-form ridge solution.
 
-    return LinearWindow()
+    Shows the ``prepare`` hook: the ridge fit uses the training split only.  Useful to
+    measure how well an optimiser HOLDS an (almost) exact solution over 50 epochs.
+    """
+
+    def __init__(self, window: int, ridge: float = 1e-10):
+        super().__init__(window)
+        self.ridge = ridge
+
+    @torch.no_grad()
+    def prepare(self, x_train: torch.Tensor, y_train: torch.Tensor) -> None:
+        x = x_train.squeeze(-1).double()
+        y = y_train.double()
+        x_mean, y_mean = x.mean(dim=0), y.mean()
+        centred = x - x_mean
+        gram = centred.t() @ centred + self.ridge * len(y) * torch.eye(x.shape[1], dtype=torch.float64)
+        weight = torch.linalg.solve(gram, centred.t() @ (y - y_mean))
+        self.readout.weight.copy_(weight.float().unsqueeze(0))
+        self.readout.bias.fill_(float(y_mean - x_mean @ weight))
+
+
+@register("ridge_init_linear")
+def _ridge_init_linear(window: int, ridge: float = 1e-10) -> nn.Module:
+    """Linear read-out initialised at the closed-form ridge solution (training split only)."""
+    return RidgeInitLinear(window, ridge=ridge)
+
+
+class WhitenedPolynomialReadout(nn.Module):
+    """Gradient-trained linear read-out of whitened monomial features of the last ``lags`` inputs.
+
+    ``prepare`` (training split only) standardises the last ``lags`` window entries, builds all
+    monomials of degree <= ``degree`` and PCA-whitens them, dropping directions whose variance
+    is below ``eigen_floor`` times the largest.  The read-out then sees features with identity
+    covariance, so the least-squares problem that is hopelessly ill-conditioned on raw windows
+    (neighbouring samples of a smooth series are almost collinear) becomes isotropic and plain
+    SGD converges within a few epochs.  The read-out starts at zero (prediction = training mean).
+
+    Trainable parameters: one weight per monomial + bias.  The standardisation / whitening
+    constants are computed in closed form from the training inputs and are not trained.
+    """
+
+    def __init__(self, window: int, lags: int | None = None, degree: int = 1, eigen_floor: float = 1e-10):
+        super().__init__()
+        import itertools
+
+        self.lags = min(lags or window, window)
+        self.eigen_floor = eigen_floor
+        combos = [c for d in range(1, degree + 1)
+                  for c in itertools.combinations_with_replacement(range(self.lags), d)]
+        # each monomial is a product of ``degree`` factors; index ``lags`` selects the constant 1
+        factors = torch.tensor([list(c) + [self.lags] * (degree - len(c)) for c in combos])
+        self.register_buffer("factors", factors)
+        n = len(combos)
+        self.register_buffer("input_mean", torch.zeros(self.lags))
+        self.register_buffer("input_scale", torch.ones(self.lags))
+        self.register_buffer("feature_mean", torch.zeros(n))
+        self.register_buffer("whitening", torch.eye(n))
+        self.register_buffer("target_mean", torch.zeros(()))
+        self.register_buffer("target_scale", torch.ones(()))
+        self.readout = nn.Linear(n, 1)
+        nn.init.zeros_(self.readout.weight)
+        nn.init.zeros_(self.readout.bias)
+
+    def monomials(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, N, 1) window -> (B, n_monomials) products of the standardised last ``lags`` entries."""
+        z = (x[:, -self.lags:, 0] - self.input_mean) / self.input_scale
+        z = torch.cat([z, torch.ones_like(z[:, :1])], dim=1)
+        return z[:, self.factors].prod(dim=-1)
+
+    @torch.no_grad()
+    def prepare(self, x_train: torch.Tensor, y_train: torch.Tensor) -> None:
+        recent = x_train[:, -self.lags:, 0].double()
+        self.input_mean.copy_(recent.mean(dim=0))
+        self.input_scale.copy_(recent.std(dim=0).clamp_min(1e-12))
+        features = self.monomials(x_train).double()
+        mean = features.mean(dim=0)
+        covariance = (features - mean).t() @ (features - mean) / len(features)
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        keep = eigenvalues > self.eigen_floor * eigenvalues.max()
+        whitening = torch.zeros_like(eigenvectors)  # dropped directions map to zero
+        whitening[:, keep] = eigenvectors[:, keep] / eigenvalues[keep].sqrt()
+        self.feature_mean.copy_(mean)
+        self.whitening.copy_(whitening)
+        self.target_mean.copy_(y_train.double().mean())
+        self.target_scale.copy_(y_train.double().std().clamp_min(1e-12))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        white = (self.monomials(x) - self.feature_mean) @ self.whitening
+        return self.readout(white).squeeze(-1) * self.target_scale + self.target_mean
+
+
+@register("whitened_poly")
+def _whitened_poly(window: int, lags: int | None = None, degree: int = 1, eigen_floor: float = 1e-10) -> nn.Module:
+    """Linear read-out of whitened degree-``degree`` monomials of the last ``lags`` inputs (zero init)."""
+    return WhitenedPolynomialReadout(window, lags=lags, degree=degree, eigen_floor=eigen_floor)

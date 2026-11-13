@@ -13,6 +13,7 @@ Sub-commands
     run            run a grid of (dataset, window, seed) cells, resumable
     time-epoch     measure the cost of one epoch for a cell
     report         final-epoch test MSE, mean +- std, next to the paper
+    compare        seed-for-seed comparison of the authors' runs with a train.py tag
 
 Examples
     python reference_repro.py param-counts
@@ -270,7 +271,20 @@ def cmd_param_counts(args):
 
 
 # --------------------------------------------------------------------- time-epoch
+def clean_epoch_seconds(run_path: Path) -> float:
+    """Median duration of an epoch (training + test evaluation) from the authors' log.
+
+    The interval that follows a prediction dump (after epochs 1, 15, 30, 50) also contains
+    that dump, so those intervals are left out.
+    """
+    intervals = epoch_seconds_from_log(run_path)  # intervals[k] = time from epoch k+1 to epoch k+2
+    clean = [seconds for k, seconds in enumerate(intervals) if (k + 1) not in (1, 15, 30, 50, 100)]
+    return float(np.median(clean)) if clean else float("nan")
+
+
 def cmd_time_epoch(args):
+    if args.epochs < 3:
+        raise SystemExit("time-epoch needs --epochs >= 3 (the interval after epoch 1 contains a prediction dump)")
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     for dataset in args.datasets:
         for window in args.windows:
@@ -282,11 +296,11 @@ def cmd_time_epoch(args):
             wall = time.time() - start
             run_path = find_completed_run(args.model, dataset, window, 0, args.epochs,
                                           args.hidden_size, args.qnn_depth)
-            per_epoch = epoch_seconds_from_log(run_path)
-            steady = float(np.mean(per_epoch)) if per_epoch else float("nan")
-            print(f"{dataset} w{window}: {args.epochs} epochs took {wall:.1f}s wall; "
-                  f"steady-state epoch (train + test eval) {steady:.1f}s; "
-                  f"estimated 50-epoch run {50 * steady / 60:.1f} min (+ 4 prediction dumps)", flush=True)
+            epoch = clean_epoch_seconds(run_path)
+            dump = epoch_seconds_from_log(run_path)[0] - epoch  # extra time of the epoch-1 prediction dump
+            print(f"{dataset} w{window}: {args.epochs} epochs took {wall:.1f}s wall; one epoch (train + test eval) "
+                  f"{epoch:.1f}s, one prediction dump {dump:.1f}s; estimated 50-epoch run "
+                  f"{(50 * epoch + 4 * dump) / 60:.1f} min", flush=True)
 
 
 # ------------------------------------------------------------------------- report
@@ -343,6 +357,31 @@ def cmd_report(args):
     print(f"\nwrote {out_path}")
 
 
+def cmd_compare(args):
+    """Seed-for-seed comparison of the authors' runs with a harness tag (train.py results)."""
+    import train  # the harness (imported here: it is not needed by the other sub-commands)
+
+    cells = {(c["dataset"], c["window"], c["seed"]): c for c in train.load_cells(args.tag)}
+    print(f"Authors' train.py ({args.model}) vs harness tag {args.tag!r}: test MSE per epoch, same seed")
+    print(f"{'dataset':24s} {'N':>3s} {'seed':>4s} {'epochs':>6s} {'authors final':>14s} {'harness final':>14s} "
+          f"{'rel.diff final':>14s} {'max rel.diff, epochs 1-5':>25s} {'max rel.diff, all epochs':>25s}")
+    worst_final = 0.0
+    compared = 0
+    for (dataset, window, seed), cell in sorted(cells.items()):
+        epochs = cell["config"]["epochs"]
+        run_path = find_completed_run(args.model, dataset, window, seed, epochs, args.hidden_size, args.qnn_depth)
+        if run_path is None:
+            continue
+        theirs = np.array([row[2] for row in read_train_log(run_path)])
+        ours = np.array(cell["curve"]["test_mse"])
+        rel = np.abs(ours - theirs) / theirs
+        worst_final = max(worst_final, rel[-1])
+        compared += 1
+        print(f"{dataset:24s} {window:3d} {seed:4d} {epochs:6d} {theirs[-1]:14.6e} {ours[-1]:14.6e} "
+              f"{rel[-1]:14.2e} {rel[:5].max():25.2e} {rel.max():25.2e}")
+    print(f"\n{compared} runs compared; largest relative difference of the final-epoch test MSE: {worst_final:.2e}")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -368,9 +407,16 @@ def build_parser():
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("time-epoch")
-    add_cell_arguments(p, ["delayed_quantum_control", "jaynes_cummings"], [16], [0], 2)
+    add_cell_arguments(p, ["delayed_quantum_control", "jaynes_cummings"], [16], [0], 3)
     p.add_argument("--no_nice", action="store_true")
     p.set_defaults(func=cmd_time_epoch)
+
+    p = sub.add_parser("compare")
+    p.add_argument("--tag", required=True, help="harness tag (runs/timeseries/<tag>) trained with model gqkan_qkanfwp")
+    p.add_argument("--model", default="gqkan_qkanfwp", choices=list(PAPER_NAME))
+    p.add_argument("--hidden_size", type=int, default=PAPER_HIDDEN_SIZE)
+    p.add_argument("--qnn_depth", type=int, default=PAPER_QNN_DEPTH)
+    p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("report")
     add_cell_arguments(p, list(protocol.ALL_DATASETS), list(protocol.WINDOWS), [0, 1, 2, 3, 4], 50)

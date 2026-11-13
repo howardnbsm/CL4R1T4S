@@ -203,8 +203,8 @@ def markdown_table(records: list[dict]) -> str:
         "",
         "| dataset | N | ridge on [window,1]: test MSE (params) | poly-lags: test MSE (degree, lags, params) "
         "| kernel ridge: test MSE | selected by hold-out | selected test MSE | params | paper best "
-        "| ours / paper best | verdict |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| ours / paper best | verdict | ridge-only verdict |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in records:
         fam = r["families"]
@@ -213,15 +213,17 @@ def markdown_table(records: list[dict]) -> str:
         poly = f"{fam['poly_lags']['test_mse']:.2e} (d={hp['degree']}, K={hp['lags']}, {fam['poly_lags']['n_parameters']})"
         kernel = f"{fam['kernel_ridge']['test_mse']:.2e}" if "kernel_ridge" in fam else "-"
         if "paper_best" in r:
-            verdict = "WIN" if round(r["test_mse"], 6) < r["paper_best"] else "lose"
-            tail = f"{r['paper_best']:.1e} | {r['ratio_to_paper_best']:.2e} | {verdict}"
+            verdict = protocol.compare_with_paper(r["test_mse"], r["paper_best"])
+            ridge_verdict = protocol.compare_with_paper(fam["ridge_window"]["test_mse"], r["paper_best"])
+            tail = f"{r['paper_best']:.1e} | {r['ratio_to_paper_best']:.2e} | {verdict} | {ridge_verdict}"
         else:
-            tail = "non-target | - | -"
+            tail = "non-target | - | - | -"
         lines.append(f"| {r['dataset']} | {r['window']} | {ridge} | {poly} | {kernel} | {r['selected_family']} "
                      f"| {r['test_mse']:.2e} | {r['n_parameters']} | {tail} |")
     targets = [r for r in records if "paper_best" in r]
-    wins = sum(round(r["test_mse"], 6) < r["paper_best"] for r in targets)
-    ridge_wins = sum(round(r["families"]["ridge_window"]["test_mse"], 6) < r["paper_best"] for r in targets)
+    wins = sum(protocol.compare_with_paper(r["test_mse"], r["paper_best"]) == "WIN" for r in targets)
+    ridge_wins = sum(protocol.compare_with_paper(r["families"]["ridge_window"]["test_mse"], r["paper_best"]) == "WIN"
+                     for r in targets)
     lines += ["", f"Selected closed-form model beats the paper's best mean on {wins} / {len(targets)} paper cells; "
                   f"plain ridge on [window,1] alone on {ridge_wins} / {len(targets)}."]
     return "\n".join(lines)
