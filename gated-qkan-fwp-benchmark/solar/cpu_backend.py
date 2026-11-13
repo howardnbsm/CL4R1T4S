@@ -181,47 +181,85 @@ def pz_reps1_coefficients(theta, preacts_weight, preacts_bias):
     return w.to(dtype), cst.to(dtype), k1.to(dtype), k2.to(dtype), k3.to(dtype)
 
 
+def _pz_reps1_edge_norms(x, w, cst, k1, k2, k3):
+    """``cos(psi), sin(psi), |alpha|, |beta|`` of every edge, each ``(N, O, I)``."""
+    psi = x.unsqueeze(1) * w
+    psi += cst
+    cos_psi = torch.cos(psi)
+    sin_psi = torch.sin_(psi)
+    norm_a = torch.addcmul(k1, k2, cos_psi * cos_psi).sqrt_()
+    norm_b = torch.addcmul(k3, k2, sin_psi * sin_psi).sqrt_()
+    return cos_psi, sin_psi, norm_a, norm_b
+
+
+@torch.no_grad()
+def pz_reps1_edge_activation(layer, x: torch.Tensor) -> torch.Tensor:
+    """Closed-form ``|alpha| - |beta|`` of every edge, ``(N, O, I)`` (for verification)."""
+    coefficients = pz_reps1_coefficients(layer.theta, layer.preacts_weight, layer.preacts_bias)
+    _, _, norm_a, norm_b = _pz_reps1_edge_norms(x, *coefficients)
+    return norm_a - norm_b
+
+
 class _PZReps1Sum(torch.autograd.Function):
     """``y[n, o] = sum_i sqrt(K1 + K2 cos^2(psi)) - sqrt(K3 + K2 sin^2(psi))``
 
     with ``psi[n, o, i] = W[o, i] * x[n, i] + C[o, i]``; analytic backward.
+    Rows are processed in blocks of ``CHUNK`` so that the ``(rows, O, I)``
+    temporaries stay cache-resident (about 3x faster than one pass; the
+    result differs from an unchunked evaluation only by float32 summation
+    order in the parameter gradients).
     """
+
+    CHUNK = 128
 
     @staticmethod
     def forward(ctx, x, w, cst, k1, k2, k3):
-        psi = x.unsqueeze(1) * w
-        psi += cst
-        cos_psi = torch.cos(psi)
-        sin_psi = torch.sin_(psi)
-        norm_a = torch.addcmul(k1, k2, cos_psi * cos_psi).sqrt_()  # |alpha|
-        norm_b = torch.addcmul(k3, k2, sin_psi * sin_psi).sqrt_()  # |beta|
+        keep = any(ctx.needs_input_grad)
+        y = x.new_empty(x.shape[0], w.shape[0])
+        cache = []
+        for start in range(0, x.shape[0], _PZReps1Sum.CHUNK):
+            stop = start + _PZReps1Sum.CHUNK
+            cos_psi, sin_psi, norm_a, norm_b = _pz_reps1_edge_norms(x[start:stop], w, cst, k1, k2, k3)
+            y[start:stop] = (norm_a - norm_b).sum(dim=2)
+            if keep:
+                cache.append((cos_psi, sin_psi, norm_a, norm_b))
         ctx.save_for_backward(x, w, k2)
-        ctx.cache = (cos_psi, sin_psi, norm_a, norm_b)
-        return (norm_a - norm_b).sum(dim=2)
+        ctx.cache = cache
+        return y
 
     @staticmethod
     def backward(ctx, grad_y):
         x, w, k2 = ctx.saved_tensors
-        cos_psi, sin_psi, norm_a, norm_b = ctx.cache
-        half_g = (0.5 * grad_y).unsqueeze(2)                       # (N, O, 1)
-        zero = norm_a.new_zeros(())
-        inv_a = torch.where(norm_a > _NORM_GUARD, norm_a.reciprocal(), zero)
-        inv_b = torch.where(norm_b > _NORM_GUARD, norm_b.reciprocal(), zero)
-        grad_a2 = half_g * inv_a                                   # dL/d|alpha|^2
-        grad_b2 = half_g * inv_b                                   # -dL/d|beta|^2
-        grad_k1 = grad_a2.sum(dim=0)
-        grad_k3 = -grad_b2.sum(dim=0)
-        cos2 = cos_psi * cos_psi
-        sin2 = sin_psi * sin_psi
-        grad_k2 = (grad_a2 * cos2).sum(dim=0) - (grad_b2 * sin2).sum(dim=0)
-        # d|alpha|^2/dpsi = -2 K2 cos sin,  d|beta|^2/dpsi = +2 K2 cos sin
-        grad_psi = grad_a2.add_(grad_b2)
-        grad_psi *= cos_psi
-        grad_psi *= sin_psi
-        grad_psi *= -2.0 * k2
-        grad_c = grad_psi.sum(dim=0)
-        grad_w = (grad_psi * x.unsqueeze(1)).sum(dim=0)
-        grad_x = (grad_psi * w).sum(dim=1)
+        grad_x = torch.empty_like(x)
+        grad_w, grad_c = torch.zeros_like(w), torch.zeros_like(w)
+        grad_k1, grad_k2, grad_k3 = torch.zeros_like(w), torch.zeros_like(w), torch.zeros_like(w)
+        minus_two_k2 = -2.0 * k2
+        for block, start in enumerate(range(0, x.shape[0], _PZReps1Sum.CHUNK)):
+            stop = start + _PZReps1Sum.CHUNK
+            cos_psi, sin_psi, norm_a, norm_b = ctx.cache[block]
+            half_g = (0.5 * grad_y[start:stop]).unsqueeze(2)           # (rows, O, 1)
+            # d|amp|/d|amp|^2 = 1 / (2 |amp|), defined as 0 at a vanishing amplitude
+            grad_a2 = norm_a.reciprocal()
+            grad_b2 = norm_b.reciprocal()
+            if float(norm_a.min()) <= _NORM_GUARD:
+                grad_a2 = torch.where(norm_a > _NORM_GUARD, grad_a2, grad_a2.new_zeros(()))
+            if float(norm_b.min()) <= _NORM_GUARD:
+                grad_b2 = torch.where(norm_b > _NORM_GUARD, grad_b2, grad_b2.new_zeros(()))
+            grad_a2 *= half_g                                          # dL/d|alpha|^2
+            grad_b2 *= half_g                                          # -dL/d|beta|^2
+            grad_k1 += grad_a2.sum(dim=0)
+            grad_k3 -= grad_b2.sum(dim=0)
+            grad_k2 += (grad_a2 * cos_psi).mul_(cos_psi).sum(dim=0)
+            grad_k2 -= (grad_b2 * sin_psi).mul_(sin_psi).sum(dim=0)
+            # d|alpha|^2/dpsi = -2 K2 cos sin,  d|beta|^2/dpsi = +2 K2 cos sin
+            grad_psi = grad_a2.add_(grad_b2)
+            grad_psi *= cos_psi
+            grad_psi *= sin_psi
+            grad_psi *= minus_two_k2
+            grad_c += grad_psi.sum(dim=0)
+            grad_x[start:stop] = (grad_psi * w).sum(dim=1)
+            grad_psi *= x[start:stop].unsqueeze(1)
+            grad_w += grad_psi.sum(dim=0)
         return grad_x, grad_w, grad_c, grad_k1, grad_k2, grad_k3
 
 
