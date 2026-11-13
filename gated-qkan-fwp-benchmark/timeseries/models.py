@@ -357,3 +357,33 @@ class WhitenedPolynomialReadout(nn.Module):
 def _whitened_poly(window: int, lags: int | None = None, degree: int = 1, eigen_floor: float = 1e-10) -> nn.Module:
     """Linear read-out of whitened degree-``degree`` monomials of the last ``lags`` inputs (zero init)."""
     return WhitenedPolynomialReadout(window, lags=lags, degree=degree, eigen_floor=eigen_floor)
+
+
+# ------------------------------------------------------------------------- v2 models
+@register("v2_qkan_vp")
+def _v2_qkan_vp(window: int, preset: str = "v2_main", **overrides) -> nn.Module:
+    """Gated QKAN-FWP v2 (time series): QKAN regressor with a closed-form read-out (``v2.py``).
+
+        xs    = (x - mu) / sigma                          mu, sigma: scalars from the training windows
+        z_j   = sum_{k<K} P_jk g^(age_k) xs_k             h = 8 encoded angles from the last K = min(N, 16) lags,
+                                                          fading-memory weights g^age with g = 0.8
+        e_oj  = <Z> of  H RZ(a0) RY(b0) RZ(z_j) RZ(a1) RY(b1) |0>     QKAN layer [h -> m], m = 2 (16 circuits)
+        y_hat = b + sum_k l_k xs_k + sum_oj c_oj e_oj     read-out = ridge solution on the training windows
+
+    Trainable by gradient (<= 50 full-batch L-BFGS evaluations of a forward-chaining validation
+    loss): P (h * K) and the circuit angles (m * h * 4).  Solved in closed form: the QKAN
+    post-activation weights c (m * h), the linear path l (N) and the bias b.
+
+    Parameters: h K + 4 m h + m h + N + 1 = 153 / 225 / 241 / 273 for N = 8 / 16 / 32 / 64.
+
+    The returned module is untrained; ``v2.fit_auto(config, x_train, y_train, seed)`` runs the
+    whole training procedure (it is not a mini-batch model, so it is not driven by ``train.py``).
+    Other presets: see ``v2.PRESETS`` - ablations (``v2_no_qkan``, ``v2_linear_edges``, ``v2_random_qkan``,
+    ``v2_tanh_edges``, ``v2_fit_objective``, ``v2_fast_measure``), a wider model (``v2_wide``, h = 16) and the
+    in-family variant ``v2_fwp159`` (h = 4, K = 10, plus an input-gated fast-weight programmer on the encoded
+    angles: h K + 4 m h + (h C + C + 1) + m h + N + 1 = 92 / 108 / 124 / 156 parameters with C = 2).
+    """
+    import v2
+
+    config = v2.V2Config(**{**v2.PRESETS[preset].to_dict(), **overrides})
+    return v2.QKANProjectionRegressor(window, config)
