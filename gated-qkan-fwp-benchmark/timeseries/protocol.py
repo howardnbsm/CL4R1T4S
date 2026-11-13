@@ -72,7 +72,12 @@ def is_paper_cell(dataset: str, window: int) -> bool:
 
 # ------------------------------------------------------------------ reference code
 def add_reference_to_path() -> None:
-    """Make the authors' ``src`` package importable (``import src.datasets...``)."""
+    """Make the authors' ``src`` package importable (``import src.datasets...``).
+
+    Bytecode caching is switched off first so that importing the reference modules
+    never writes ``__pycache__`` files into the read-only reference checkout.
+    """
+    sys.dont_write_bytecode = True
     root = str(REFERENCE_ROOT)
     if root not in sys.path:
         sys.path.insert(0, root)
