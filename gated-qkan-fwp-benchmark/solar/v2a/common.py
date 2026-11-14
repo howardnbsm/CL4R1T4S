@@ -18,6 +18,16 @@ training target (embargo of 131 windows).
     cv3   1564..1823    0..1432      1923-05..1955-11  (16, 17, 18)
     cv4   1824..2083    0..1692      1945-01..1977-07  (18, 19, 20: strongest)
     val   2084..2343    0..2083      1966-09..1999-04  (official; NO embargo, as v1)
+
+"Far" folds far1..far4 (test-like distance)
+-------------------------------------------
+The official test windows are 2344..2605, i.e. 261..522 windows after the last training
+window (the validation block lies in between and may not be trained on), whereas the
+official validation windows are 1..260 windows after it and share target months with the
+training targets.  ``farK`` uses the evaluation block of ``cvK`` but fits only on windows
+``i <= v0 - 261``, reproducing the train -> test distance (the block of 260 windows in
+front of the evaluation block is left out, exactly like the validation block in front of
+the test block).
 """
 
 from __future__ import annotations
@@ -64,6 +74,9 @@ def folds(names=("cv1", "cv2", "cv3", "cv4", "val")):
     for name in names:
         if name == "val":
             out[name] = (np.arange(0, N_TRAIN), np.arange(N_TRAIN, N_TRAIN + N_VAL))
+        elif name.startswith("far"):
+            v0 = starts["cv" + name[3:]]
+            out[name] = (np.arange(0, v0 - FOLD_VAL_SIZE), np.arange(v0, v0 + FOLD_VAL_SIZE))
         else:
             v0 = starts[name]
             assert v0 + FOLD_VAL_SIZE <= N_TRAIN

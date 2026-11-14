@@ -82,7 +82,13 @@ DEFAULTS = dict(
     lead_value=False,      # leadtime decoder: the query also contains beta_i * (baseline forecast value at that lead)
     lead_rel=False,        # ... and gamma_i * (baseline value at that lead / maximum of the baseline curve)
     prog_gain=1.0,         # initial value of the learnable scalar multiplying the programmed angles (theta0=True only)
-    query="summary",       # "summary": query offset = Linear(recent summary); "static": a learned constant vector
+    query="summary",       # "summary": query offset = Linear(recent summary); "static": a learned constant vector;
+                           # "clock": query_i = w_i * (cycle clock angle) + b_i  (w, b learnable, I = len(clock_freqs))
+    clock="minimum",       # cycle clock (query="clock"): "minimum" = 2 pi * (months since the last minimum of the
+                           # smoothed window) / 132;  "fourier" = phase of the 132-month harmonic of the last 132 months
+    clock_freqs=(1.0, 0.5),  # initial w_i (cycles per 132 months of the clock)
+    clock_sigma=8.0,       # "minimum" clock: Gaussian smoothing (months)
+    clock_margin=6,        # "minimum" clock: a minimum is accepted once it lies this many months before the window end
     program=True,          # False (ablation): no slow programmer / fast weights, angles = static theta0 only
     # baseline (the linear part of the model, solved in closed form on the fit split)
     baseline="mean",       # "mean": mean normalised target curve; "ridge": ridge forecast from the recent summary
@@ -120,6 +126,19 @@ class Features:
         self.slope_kernel = t / (t * t).sum() * patch       # slope expressed as change over one patch
         self.token_dim = 1 + int(cfg["slope_feature"]) + self.position.shape[1]
         self.query_dim = cfg["query_months"] // cfg["query_patch"]
+        t_end = torch.arange(HORIZON, dtype=torch.float32) - (HORIZON - 1)       # 0 at the window end
+        self.clock_cos = torch.cos(2 * math.pi * t_end / HORIZON) / HORIZON
+        self.clock_sin = torch.sin(2 * math.pi * t_end / HORIZON) / HORIZON
+
+    def clock(self, xn: torch.Tensor) -> torch.Tensor:
+        """Cycle clock angle (B, 1) in radians, computed from the scale-normalised window."""
+        if self.cfg["clock"] == "fourier":
+            seg = xn[:, SEQ_LEN - HORIZON:]
+            return torch.atan2(seg @ self.clock_sin, seg @ self.clock_cos).unsqueeze(1)
+        if self.cfg["clock"] == "minimum":
+            since = months_since_last_minimum(xn, sigma=self.cfg["clock_sigma"], margin=self.cfg["clock_margin"])
+            return (2 * math.pi / HORIZON) * since.unsqueeze(1)
+        raise ValueError(self.cfg["clock"])
 
     def __call__(self, x: torch.Tensor):
         """x: (B, 528) scaled windows -> dict(tokens (B, T, d), summary (B, n_q), scale (B, 1))."""
@@ -140,7 +159,34 @@ class Features:
         tokens = torch.cat(cols, dim=2)
         recent = xn[:, SEQ_LEN - cfg["query_months"]:]
         summary = recent.view(x.shape[0], self.query_dim, cfg["query_patch"]).mean(dim=2)
-        return {"tokens": tokens, "summary": summary, "scale": scale}
+        out = {"tokens": tokens, "summary": summary, "scale": scale}
+        if cfg["query"] == "clock":
+            out["clock"] = self.clock(xn)
+        return out
+
+
+def months_since_last_minimum(xn: torch.Tensor, sigma: float = 8.0, half_width: int = 40, margin: int = 6,
+                              cap: float = 220.0) -> torch.Tensor:
+    """Months from the last minimum of the Gaussian-smoothed window to the window end, (B,).
+
+    The window is smoothed with a Gaussian of ``sigma`` months (edge-renormalised).  A minimum is a month whose
+    smoothed value is the lowest within +-``half_width`` months (neighbourhood truncated at the window end) and
+    that lies at least ``margin`` months before the window end and ``half_width`` months after its start.  If
+    the window has no such month the cap is returned.  Only the given window is used.
+    """
+    from scipy.ndimage import gaussian_filter1d, minimum_filter1d
+
+    x = xn.double().numpy()
+    smooth = gaussian_filter1d(x, sigma, axis=1, mode="constant", cval=0.0, truncate=4.0)
+    smooth = smooth / gaussian_filter1d(np.ones_like(x[:1]), sigma, axis=1, mode="constant", cval=0.0, truncate=4.0)
+    local_min = minimum_filter1d(smooth, size=2 * half_width + 1, axis=1, mode="constant", cval=np.inf)
+    n_t = x.shape[1]
+    is_min = smooth <= local_min
+    is_min[:, :half_width] = False
+    is_min[:, n_t - margin:] = False
+    last = n_t - 1 - np.argmax(is_min[:, ::-1], axis=1)              # index of the last minimum
+    since = np.where(is_min.any(axis=1), n_t - 1 - last, cap)
+    return torch.from_numpy(np.minimum(since, cap).astype(np.float32))
 
 
 class GatedQKANFWP2(nn.Module):
@@ -182,6 +228,11 @@ class GatedQKANFWP2(nn.Module):
             self.query = nn.Linear(self.features.query_dim, n_in)
         elif cfg["query"] == "static":
             self.query_bias = nn.Parameter(torch.zeros(n_in))
+        elif cfg["query"] == "clock":
+            freqs = list(cfg["clock_freqs"])
+            assert len(freqs) == n_in, "query='clock' needs len(clock_freqs) == I"
+            self.clock_w = nn.Parameter(torch.tensor(freqs, dtype=torch.float32))
+            self.clock_b = nn.Parameter(torch.zeros(n_in))
         else:
             raise ValueError(cfg["query"])
         if not cfg["program"]:
@@ -334,6 +385,14 @@ class GatedQKANFWP2(nn.Module):
             return torch.einsum("boi,bi->bo", weight, query)
         return torch.einsum("boi,bqi->bqo", weight, query)
 
+    def query_vector(self, feats: dict) -> torch.Tensor:
+        """The query of the fast programmer, (B, I)."""
+        if self.cfg["query"] == "summary":
+            return self.query(feats["summary"])
+        if self.cfg["query"] == "clock":
+            return feats["clock"] * self.clock_w + self.clock_b
+        return self.query_bias.unsqueeze(0).expand(feats["summary"].shape[0], -1)
+
     def forward_features(self, feats: dict) -> torch.Tensor:
         cfg = self.cfg
         batch = feats["summary"].shape[0]
@@ -341,10 +400,7 @@ class GatedQKANFWP2(nn.Module):
             theta, _ = self.fast_weights(feats["tokens"])
         else:
             theta = self.theta0.unsqueeze(0).expand(batch, -1, -1, -1, -1)
-        if cfg["query"] == "summary":
-            q0 = self.query(feats["summary"])                               # (B, I)
-        else:
-            q0 = self.query_bias.unsqueeze(0).expand(batch, -1)
+        q0 = self.query_vector(feats)                                       # (B, I)
         base = feats["base"] if "base" in feats else self.baseline_curve(feats)
         if cfg["decoder"] == "basis":
             z = self.dropout(self.fast_layer(q0, theta))                     # (B, O)

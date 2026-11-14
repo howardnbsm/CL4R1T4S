@@ -89,24 +89,44 @@ def bump_calibrate(pred: np.ndarray, gain: float, sigma: float = SIGMA_MONTHS) -
 
 
 def fit_gain(pred_oob: np.ndarray, y: np.ndarray) -> float:
-    """The scalar gain minimising mean |max(y) - (1 + a) max(pred_oob)| on the fit windows."""
+    """"full" gain: the scalar minimising mean |max(y) - (1 + a) max(pred_oob)| on the fit windows."""
     top_pred, top_true = pred_oob.max(axis=1), np.asarray(y, dtype=np.float64).max(axis=1)
     errors = [np.abs(top_true - (1.0 + a) * top_pred).mean() for a in GAIN_GRID]
     return float(GAIN_GRID[int(np.argmin(errors))])
 
 
+def fit_balanced_gain(pred_oob: np.ndarray, y: np.ndarray, gain_full: float) -> float:
+    """"balanced" gain: argmin over a in [0, gain_full] of  MSE(a) / MSE(0) + PAE(a) / PAE(0)  on the
+    out-of-block forecasts of the fit windows (the two reported metrics the bump moves, equally weighted,
+    each relative to the uncalibrated forecast)."""
+    y = np.asarray(y, dtype=np.float64)
+    top_true = y.max(axis=1)
+    grid = GAIN_GRID[GAIN_GRID <= gain_full + 1e-12]
+
+    def both(a):
+        cal = bump_calibrate(pred_oob, a)
+        return np.mean((cal - y) ** 2), np.abs(top_true - cal.max(axis=1)).mean()
+
+    mse0, pae0 = both(0.0)
+    scores = [m / mse0 + p / pae0 for m, p in map(both, grid)]
+    return float(grid[int(np.argmin(scores))])
+
+
+CALIBRATIONS = ("none", "balanced", "full")
+
+
 class Ensemble:
-    """A fitted candidate: member forecasters + the peak-calibration gain."""
+    """A fitted candidate: member forecasters + the peak-calibration gains."""
 
-    def __init__(self, members, gain, info):
-        self.members, self.gain, self.info = members, gain, info
+    def __init__(self, members, gains, info):
+        self.members, self.gains, self.info = members, dict(gains, none=0.0), info
 
-    def predict(self, x: np.ndarray, calibrated: bool = True) -> np.ndarray:
+    def predict(self, x: np.ndarray, calibration: str = "balanced") -> np.ndarray:
         x = np.asarray(x, dtype=np.float32)
         mean = np.mean([m.predict(x).astype(np.float64) for m in self.members], axis=0)
         mean = np.maximum(mean, 0.0)
-        if calibrated:
-            mean = bump_calibrate(mean, self.gain)
+        if self.gains[calibration]:
+            mean = bump_calibrate(mean, self.gains[calibration])
         return mean.astype(np.float32)
 
     def n_parameters(self) -> dict:
@@ -139,24 +159,27 @@ def fit_candidate(name: str, x_fit, y_fit, seed: int) -> Ensemble:
         members.append(member)
         oob.append(_out_of_block_forecast(member, x_fit, y_fit, lam))
     pred_oob = np.maximum(np.mean(oob, axis=0), 0.0)
-    gain = fit_gain(pred_oob, y_fit)
-    info = {"candidate": name, "seed": seed, "gain": gain, "seconds": time.time() - t0,
+    gain_full = fit_gain(pred_oob, y_fit)
+    gains = {"full": gain_full, "balanced": fit_balanced_gain(pred_oob, y_fit, gain_full)}
+    info = {"candidate": name, "seed": seed, "gains": gains, "seconds": time.time() - t0,
             "oob_scaled_mse": float(np.mean((pred_oob - np.asarray(y_fit, dtype=np.float64)) ** 2))}
-    return Ensemble(members, gain, info)
+    return Ensemble(members, gains, info)
 
 
-def fit(seed: int, candidate: str = RECOMMENDED, calibrated: bool = True):
+def fit(seed: int, candidate: str = RECOMMENDED, calibration: str = "balanced"):
     """Final-fit entry point: train on the TRAINING split only, return ``predict_fn``.
 
     ``predict_fn(x)`` maps scaled windows ``(n, 528)`` to scaled forecasts ``(n, 132)`` (float32).
+    ``calibration``: "none" | "balanced" | "full" (see the module docstring).
     The validation split is not used; the test split is sealed.
     """
+    assert calibration in CALIBRATIONS
     d = C.data()
     x_train, y_train = d.split("train")
     ensemble = fit_candidate(candidate, x_train, y_train, seed)
 
     def predict_fn(x):
-        return ensemble.predict(x, calibrated=calibrated)
+        return ensemble.predict(x, calibration=calibration)
 
     predict_fn.ensemble = ensemble
     return predict_fn
@@ -168,17 +191,22 @@ def fit(seed: int, candidate: str = RECOMMENDED, calibrated: bool = True):
 
 RESULTS = C.RUNS_DIR / "final" / "results.jsonl"
 KEYS = ("scaled_mse", "pae", "pte", "peak_aware_mse")
+ALL_FOLDS = ("cv1", "cv2", "cv3", "cv4", "far1", "far2", "far3", "far4", "val")
 
 
 def _load_results():
     if not RESULTS.is_file():
         return []
-    return [json.loads(line) for line in RESULTS.read_text().splitlines() if line.strip()]
+    rows = [json.loads(line) for line in RESULTS.read_text().splitlines() if line.strip()]
+    for r in rows:                      # rows written before the balanced calibration existed
+        if "none" not in r:
+            r["none"], r["full"], r["gains"] = r.pop("raw"), r.pop("cal"), {"full": r.pop("gain")}
+    return rows
 
 
 def run(candidates, fold_names, seeds, part=(0, 1)):
     RESULTS.parent.mkdir(parents=True, exist_ok=True)
-    done = {(r["candidate"], r["fold"], r["seed"]) for r in _load_results()}
+    done = {(r["candidate"], r["fold"], r["seed"]) for r in _load_results() if "balanced" in r}
     d = C.data()
     folds = C.folds(tuple(fold_names))
     jobs = [(c, f, s) for c in candidates for f in fold_names for s in seeds]
@@ -187,49 +215,56 @@ def run(candidates, fold_names, seeds, part=(0, 1)):
             continue
         fit_idx, ev = folds[f]
         ens = fit_candidate(cand, d.X[fit_idx], d.Y[fit_idx], seed)
-        raw = C.score(ens.predict(d.X[ev], calibrated=False), d.Y[ev])
-        cal = C.score(ens.predict(d.X[ev], calibrated=True), d.Y[ev])
-        rec = {"candidate": cand, "fold": f, "seed": seed, "gain": ens.gain, "params": ens.n_parameters(),
-               "raw": {k: raw[k] for k in KEYS}, "cal": {k: cal[k] for k in KEYS},
+        rec = {"candidate": cand, "fold": f, "seed": seed, "gains": ens.gains, "params": ens.n_parameters(),
                "oob_scaled_mse": ens.info["oob_scaled_mse"], "seconds": round(ens.info["seconds"], 1)}
+        for cal in CALIBRATIONS:
+            m = C.score(ens.predict(d.X[ev], calibration=cal), d.Y[ev])
+            rec[cal] = {k: m[k] for k in KEYS}
         with open(RESULTS, "a") as handle:
             handle.write(json.dumps(rec) + "\n")
-        print(f"{cand:16s} {f:4s} s{seed} gain {ens.gain:.2f} raw {C.short(raw)} cal {C.short(cal)} "
-              f"params {rec['params']['total']} {rec['seconds']:.0f}s", flush=True)
+        print(f"{cand:16s} {f:4s} s{seed} gains {ens.gains['balanced']:.2f}/{ens.gains['full']:.2f} none {C.short(rec['none'])} "
+              f"bal {C.short(rec['balanced'])} full {C.short(rec['full'])} params {rec['params']['total']} "
+              f"{rec['seconds']:.0f}s", flush=True)
 
 
-def table(which=("raw", "cal")):
+def table(which=CALIBRATIONS, names=None):
     rows = _load_results()
-    names = []
+    order = []
     for r in rows:
-        if r["candidate"] not in names:
-            names.append(r["candidate"])
-    fold_names = ("cv1", "cv2", "cv3", "cv4", "val")
+        if r["candidate"] not in order:
+            order.append(r["candidate"])
+    names = [n for n in order if names is None or n in names]
     summary = {}
     for kind in which:
-        print(f"== {'uncalibrated' if kind == 'raw' else 'peak-calibrated'}: scaled MSE / PAE / PTE, mean over seeds "
-              f"(val: mean +- population std)")
+        print(f"== calibration {kind}: scaled MSE / PAE / PTE, mean over seeds (n); val: mean +- population std")
         for name in names:
-            cells, cv = [], []
-            for f in fold_names:
-                rs = [r for r in rows if r["candidate"] == name and r["fold"] == f]
+            cells, groups = [], {"cv": [], "far": []}
+            for f in ALL_FOLDS:
+                rs = [r for r in rows if r["candidate"] == name and r["fold"] == f and kind in r]
                 if not rs:
-                    cells.append("-")
+                    cells.append(f"{f} -")
                     continue
                 vals = np.array([[r[kind][k] for k in ("scaled_mse", "pae", "pte")] for r in rs])
                 mean, std = vals.mean(axis=0), vals.std(axis=0)
+                entry = summary.setdefault(name, {}).setdefault(kind, {})
+                entry[f] = {"n_seeds": len(rs), "mse": mean[0], "pae": mean[1], "pte": mean[2],
+                            "mse_std": std[0], "pae_std": std[1], "pte_std": std[2],
+                            "gain": float(np.mean([r["gains"].get(kind, 0.0) for r in rs]))}
                 if f == "val":
-                    cells.append(f"{mean[0]:.4f}+-{std[0]:.4f}/{mean[1]:.1f}+-{std[1]:.1f}/{mean[2]:.1f}+-{std[2]:.1f} (n={len(rs)})")
-                    summary.setdefault(name, {})[kind] = {
-                        "n_seeds": len(rs), "val_mse_mean": mean[0], "val_mse_std": std[0], "val_pae_mean": mean[1],
-                        "val_pae_std": std[1], "val_pte_mean": mean[2], "val_pte_std": std[2]}
+                    cells.append(f"val {mean[0]:.4f}+-{std[0]:.4f}/{mean[1]:.1f}+-{std[1]:.1f}/{mean[2]:.1f}+-{std[2]:.1f}(n{len(rs)})")
                 else:
-                    cv.append(mean)
-                    cells.append(f"{mean[0]:.4f}/{mean[1]:.1f}/{mean[2]:.1f}(n={len(rs)})")
-                    summary.setdefault(name, {}).setdefault(kind + "_cv", {})[f] = [float(v) for v in mean]
-            cvm = np.mean(cv, axis=0) if cv else [float("nan")] * 3
+                    groups[f[:-1]].append(mean)
+                    cells.append(f"{mean[0]:.4f}/{mean[1]:.0f}/{mean[2]:.0f}(n{len(rs)})")
+            means = []
+            for g in ("cv", "far"):
+                if len(groups[g]) == 4:
+                    gm = np.mean(groups[g], axis=0)
+                    summary[name][kind][g + "_mean"] = {"mse": gm[0], "pae": gm[1], "pte": gm[2]}
+                    means.append(f"{g}mean {gm[0]:.4f}/{gm[1]:.1f}/{gm[2]:.1f}")
+                else:
+                    means.append(f"{g}mean -")
             par = next(r["params"]["total"] for r in rows if r["candidate"] == name)
-            print(f"{name:16s} par {par:6d} | cvmean {cvm[0]:.4f}/{cvm[1]:.1f}/{cvm[2]:.1f} | " + "  ".join(cells))
+            print(f"{name:18s} par {par:6d} | " + " | ".join(means) + " | " + "  ".join(cells))
     (RESULTS.parent / "summary.json").write_text(json.dumps(summary, indent=1, default=float))
 
 
@@ -238,12 +273,13 @@ if __name__ == "__main__":
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--candidates", nargs="+", default=[RECOMMENDED])
-    r.add_argument("--folds", nargs="+", default=["cv1", "cv2", "cv3", "cv4", "val"])
+    r.add_argument("--folds", nargs="+", default=list(ALL_FOLDS))
     r.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     r.add_argument("--part", default="0/1")
-    sub.add_parser("table")
+    t = sub.add_parser("table")
+    t.add_argument("--names", nargs="*", default=None)
     cli = ap.parse_args()
     if cli.cmd == "run":
         run(cli.candidates, cli.folds, cli.seeds, tuple(int(v) for v in cli.part.split("/")))
     else:
-        table()
+        table(names=cli.names)

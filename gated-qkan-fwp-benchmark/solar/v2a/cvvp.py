@@ -50,6 +50,11 @@ CVVP_DEFAULTS = dict(
     warmup=5,
     clip=1.0,
     alpha=0.0,         # peak-aware weighting (1 + alpha * y) of the out-of-block error
+    skip=False,        # True: the read-out also sees the standardised recent summary (11 numbers), i.e. the model
+                       # is "closed-form linear part + QKAN-FWP nonlinear part" solved jointly by one ridge
+    z_gain=1.0,        # skip=True: the QKAN-FWP features enter the ridge as z_gain * standardise(z), i.e. their
+                       # ridge penalty is lam / z_gain^2 (z_gain -> 0 recovers the purely linear ridge)
+    learn_gain=False,  # skip=True: z_gain is a trainable scalar (trained through the out-of-block error)
 )
 
 
@@ -70,8 +75,7 @@ def hidden(model: GatedQKANFWP2, feats: dict) -> torch.Tensor:
         theta, _ = model.fast_weights(feats["tokens"])
     else:
         theta = model.theta0.unsqueeze(0).expand(batch, -1, -1, -1, -1)
-    q0 = model.query(feats["summary"]) if cfg["query"] == "summary" else model.query_bias.expand(batch, -1)
-    return model.fast_layer(q0, theta)
+    return model.fast_layer(model.query_vector(feats), theta)
 
 
 def _ridge(z, t, lam):
@@ -107,13 +111,17 @@ def out_of_block_prediction(z, t, lam, blocks, scheme="two_sided", forward_start
 class CVVPForecaster:
     """A fitted model: programmer (torch module) + closed-form read-out."""
 
-    def __init__(self, model, z_mean, z_std, w, bias, info):
+    def __init__(self, model, z_mean, z_std, w, bias, info, skip=None):
         self.model, self.z_mean, self.z_std, self.w, self.bias, self.info = model, z_mean, z_std, w, bias, info
+        self.skip = skip          # None, or (summary mean, summary std, z_gain)
 
     @torch.no_grad()
     def features(self, x: np.ndarray):
         feats = self.model.features(torch.from_numpy(np.asarray(x, dtype=np.float32)))
         z = (hidden(self.model, feats).double() - self.z_mean) / self.z_std
+        if self.skip is not None:
+            s_mean, s_std, gain = self.skip
+            z = torch.cat([(feats["summary"].double() - s_mean) / s_std, gain * z], dim=1)
         return z, feats["scale"].double()
 
     @torch.no_grad()
@@ -126,9 +134,13 @@ class CVVPForecaster:
         return torch.cat(out).numpy()
 
     def n_parameters(self) -> dict:
-        trainable = int(sum(p.numel() for p in self.model.parameters() if p.requires_grad)) \
-            - sum(p.numel() for p in self.model.readout.parameters())
+        # trainable programmer parameters (the unused SGD read-out of model.py is frozen and not counted;
+        # prog_gain is unused when there is no programming)
+        trainable = int(sum(p.numel() for name, p in self.model.named_parameters() if p.requires_grad
+                            and not (name == "prog_gain" and not self.model.cfg["program"])))
         closed_form = int(self.w.numel() + self.bias.numel())
+        if self.skip is not None:
+            trainable += 1                                         # the gain of the QKAN-FWP features
         return {"programmer_trainable": trainable, "readout_closed_form": closed_form,
                 "total": trainable + closed_form}
 
@@ -148,13 +160,22 @@ def fit_cvvp(mcfg, tcfg, x_fit, y_fit, seed=0, x_mon=None, y_mon=None, log=None)
     target = yf.double() / scale                                   # normalised targets
     weight = scale ** 2                                            # error in scaled units = scale * normalised error
     params = [p for p in model.parameters() if p.requires_grad]
+    skip = bool(tcfg["skip"])
+    log_gain = torch.tensor(math.log(tcfg["z_gain"]), dtype=torch.float64, requires_grad=skip and tcfg["learn_gain"])
+    if skip:
+        summary = feats["summary"].double()
+        s_mean, s_std = summary.mean(dim=0), summary.std(dim=0) + 1e-6
+        s_fit = (summary - s_mean) / s_std
+        if tcfg["learn_gain"]:
+            params = params + [log_gain]
     opt = torch.optim.AdamW(params, lr=tcfg["lr"], weight_decay=tcfg["wd"])
     history = []
     t0 = time.time()
 
     def standardised(z):
         z = z.double()
-        return (z - z.mean(dim=0)) / (z.std(dim=0) + 1e-6)
+        z = (z - z.mean(dim=0)) / (z.std(dim=0) + 1e-6)
+        return torch.cat([s_fit, torch.exp(log_gain) * z], dim=1) if skip else z
 
     for step in range(tcfg["steps"]):
         frac = step / max(1, tcfg["steps"] - 1)
@@ -183,13 +204,16 @@ def fit_cvvp(mcfg, tcfg, x_fit, y_fit, seed=0, x_mon=None, y_mon=None, log=None)
         z_raw = hidden(model, feats).double()
         z_mean, z_std = z_raw.mean(dim=0), z_raw.std(dim=0) + 1e-6
         z = (z_raw - z_mean) / z_std
+        gain = float(torch.exp(log_gain))
+        if skip:
+            z = torch.cat([s_fit, gain * z], dim=1)
         pred, first = out_of_block_prediction(z, target, tcfg["lam"], tcfg["blocks"], tcfg["scheme"],
                                               tcfg["forward_start"])
         oob = float((((pred - target[first:]) ** 2) * weight[first:]).mean())
         w, zm, tm = _ridge(z, target, tcfg["lam"])
         bias = tm - zm @ w
-    info = {"history": history, "oob_mse_final": oob, "seconds": time.time() - t0}
-    forecaster = CVVPForecaster(model, z_mean, z_std, w, bias, info)
+    info = {"history": history, "oob_mse_final": oob, "seconds": time.time() - t0, "z_gain": gain}
+    forecaster = CVVPForecaster(model, z_mean, z_std, w, bias, info, skip=(s_mean, s_std, gain) if skip else None)
     info["params"] = forecaster.n_parameters()
     if x_mon is not None:
         info["monitor"] = C.score(forecaster.predict(x_mon), y_mon)

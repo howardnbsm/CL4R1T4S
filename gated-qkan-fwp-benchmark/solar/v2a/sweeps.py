@@ -107,3 +107,49 @@ CVVP_SWEEPS["v3"] = [
     ("E4_small_fwd60", dict(O=8, I=6, q=6, h=8, theta0=True), dict(**_F60), 4),
     ("E2_fwd60_nonorm", dict(**_V, norm="none"), dict(**_F60), 2),
 ]
+
+# -- v4: linear skip.  Read-out = ridge on [standardised recent summary (11), z_gain * QKAN-FWP features] -------
+_SK = dict(skip=True, lam=0.03)
+CVVP_SWEEPS["v4"] = [
+    ("K_rand_g0.3", dict(**_V), dict(steps=0, z_gain=0.3, **_SK), 1),
+    ("K_rand_g1", dict(**_V), dict(steps=0, z_gain=1.0, **_SK), 1),
+    ("K_fwd60_g0.3", dict(**_V), dict(steps=60, scheme="forward", z_gain=0.3, **_SK), 1),
+    ("K_fwd60_learn", dict(**_V), dict(steps=60, scheme="forward", z_gain=0.3, learn_gain=True, **_SK), 1),
+    ("K_two60_learn", dict(**_V), dict(steps=60, z_gain=0.3, learn_gain=True, **_SK), 1),
+    ("K_fwd60_learn_O8", dict(O=8, I=6, theta0=True), dict(steps=60, scheme="forward", z_gain=0.3, learn_gain=True, **_SK), 1),
+]
+
+# -- v5: CLOCK query.  The fast programmer is queried with the cycle clock (I = 2 learnable frequencies); read-out =
+#        ridge on [recent summary, z_gain * QKAN-FWP features].  Small programmer (q=6, h=8, O=4, reps=1). ---------------
+_CK = dict(query="clock", O=4, I=2, reps=1, q=6, h=8, theta0=True)
+_SKC = dict(skip=True, lam=0.03, z_gain=0.3)
+_TR = dict(steps=60, lr=1e-2, learn_gain=True)
+CVVP_SWEEPS["v5"] = [
+    ("CK_min_static_rand", dict(**_CK, program=False), dict(steps=0, **_SKC), 1),
+    ("CK_min_static", dict(**_CK, program=False), dict(**_TR, **_SKC), 1),
+    ("CK_min_prog", dict(**_CK), dict(**_TR, **_SKC), 1),
+    ("CK_min_prog_fwd", dict(**_CK), dict(**_TR, **_SKC, scheme="forward"), 1),
+    ("CK_fou_static", dict(**_CK, program=False, clock="fourier"), dict(**_TR, **_SKC), 1),
+    ("CK_fou_prog", dict(**_CK, clock="fourier"), dict(**_TR, **_SKC), 1),
+]
+
+# -- v6: static-vs-programmed clock variants with random / trained angles (cheap; 5 seeds, all folds) -----------------
+_CKS = dict(**_CK, program=False)
+_R = dict(steps=0, skip=True, lam=0.03)
+CVVP_SWEEPS["v6"] = [
+    ("S_rand_g0.3", dict(**_CKS), dict(**_R, z_gain=0.3), 1),
+    ("S_rand_g0.5", dict(**_CKS), dict(**_R, z_gain=0.5), 1),
+    ("S_rand_g0.3_m12", dict(**_CKS, clock_margin=12), dict(**_R, z_gain=0.3), 1),
+    ("S_rand_g0.3_O8", dict(**dict(_CKS, O=8)), dict(**_R, z_gain=0.3), 1),
+    ("S_rand_g0.3_f1", dict(**dict(_CKS, I=1, clock_freqs=(1.0,))), dict(**_R, z_gain=0.3), 1),
+    ("S_rand_g0.3_reps2", dict(**dict(_CKS, reps=2)), dict(**_R, z_gain=0.3), 1),
+    ("S_rand_g0.3_E4", dict(**_CKS), dict(**_R, z_gain=0.3), 4),
+    ("P_rand_g0.3", dict(**_CK), dict(**_R, z_gain=0.3), 1),
+    ("P_rand_g0.3_pg0.1", dict(**_CK, prog_gain=0.1), dict(**_R, z_gain=0.3), 1),
+    ("P_rand_g0.3_pg0.1_E4", dict(**_CK, prog_gain=0.1), dict(**_R, z_gain=0.3), 4),
+    ("P_rand_g0.3_E4", dict(**_CK), dict(**_R, z_gain=0.3), 4),
+    ("S_rand_g0.3_fourier", dict(**_CKS, clock="fourier"), dict(**_R, z_gain=0.3), 1),
+    ("S_rand_g0.2", dict(**_CKS), dict(**_R, z_gain=0.2), 1),
+    ("S_rand_g0.3_sig12", dict(**_CKS, clock_sigma=12.0), dict(**_R, z_gain=0.3), 1),
+    ("S_rand_g0.3_f3", dict(**dict(_CKS, I=3, clock_freqs=(1.0, 0.5, 2.0))), dict(**_R, z_gain=0.3), 1),
+]
