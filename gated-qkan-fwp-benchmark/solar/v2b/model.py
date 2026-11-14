@@ -46,6 +46,7 @@ DEFAULT = dict(
     arch="daruan",            # "daruan" | "linear" | "tanh" | "none" (ablations)
     head_w=0.0,               # weight of the peak-height head column in the blocked-CV objective
     alpha=0.0,                # peak-aware weight (1 + alpha * y) of the closed-form readout (0 = plain)
+    gate="none",              # "none" | "lvl" | "cyc" | "max": QKAN features additionally multiplied by an amplitude feature
     calib="none",             # "none" | "gain" | "head"
     strength=1.0,             # calibration strength in [0, 1]; "auto" = joint MSE/PAE criterion on OOF forecasts
     sigma=calib.SIGMA_DEFAULT, gain_max=2.5,
@@ -57,7 +58,9 @@ def featurize(x):
     x = np.asarray(x, dtype=np.float64)
     s = x.mean(axis=1, keepdims=True) + 1e-3
     cyc = F.cycle_descriptors(x)
-    return dict(s=s, ann=F.patch_means(x, 12, 132) / s, phi=2 * np.pi * cyc[:, :1] / 132.0)
+    ann = F.patch_means(x, 12, 132) / s
+    return dict(s=s, ann=ann, phi=2 * np.pi * cyc[:, :1] / 132.0,
+                lvl=ann[:, -1:], cyc=ann.mean(axis=1, keepdims=True), max=ann.max(axis=1, keepdims=True))
 
 
 def subset(feats, idx):
@@ -137,6 +140,12 @@ class ClockQKAN:
             colw[-1] = cfg["head_w"]
         omega = (1.0 + cfg["alpha"] * t64(y)) if cfg["alpha"] > 0 else None
         d_lin, m = Zlin.shape[1], (0 if cfg["arch"] == "none" else cfg["m"])
+        gated = cfg["gate"] != "none" and m > 0
+        if gated:
+            a = feats[cfg["gate"]]
+            self.a_mu, self.a_sd = a.mean(0), a.std(0) + 1e-9
+            A = t64((a - self.a_mu) / self.a_sd)
+        m_feat = 2 * m if gated else m
         torch.manual_seed(seed)
         np.random.seed(seed)
         if cfg["arch"] == "daruan":
@@ -155,11 +164,13 @@ class ClockQKAN:
         splits = [(torch.tensor(tr), torch.tensor(held)) for tr, held in calib.crossfit_blocks(idx, cfg["n_blocks"])]
 
         def pen():
-            return torch.cat([pen_lin, torch.exp(loglam).expand(m)]) if m else pen_lin
+            return torch.cat([pen_lin, torch.exp(loglam).expand(m_feat)]) if m else pen_lin
 
         def feats_of(H, tr):
             if layer is None:
                 return Zlin, None
+            if gated:
+                H = torch.cat([H, A * (H - H[tr].mean(0)) / (H[tr].std(0) + 1e-6)], dim=1)
             h_mu, h_sd = H[tr].mean(0), H[tr].std(0) + 1e-6
             return torch.cat([Zlin, (H - h_mu) / h_sd], dim=1), (h_mu, h_sd)
 
@@ -198,6 +209,9 @@ class ClockQKAN:
             all_idx = torch.arange(n)
             Fz, st = feats_of(H, all_idx)
             self.h_stats = st
+            self.gated = gated
+            if gated:
+                self.h_raw_stats = (H.mean(0), H.std(0) + 1e-6)
             self.W, self.b = readout(Fz, all_idx)
             self.pen = pen().clone()
             coef_oof = oof(H).numpy()
@@ -257,6 +271,9 @@ class ClockQKAN:
             Z = torch.tensor((feats["ann"] - self.mu) / self.sd, dtype=torch.float64)
             if self.layer is not None:
                 H = self.layer(torch.tensor(feats["phi"], dtype=torch.float64))
+                if self.gated:
+                    A = torch.tensor((feats[self.cfg["gate"]] - self.a_mu) / self.a_sd, dtype=torch.float64)
+                    H = torch.cat([H, A * (H - self.h_raw_stats[0]) / self.h_raw_stats[1]], dim=1)
                 Z = torch.cat([Z, (H - self.h_stats[0]) / self.h_stats[1]], dim=1)
             return (Z @ self.W + self.b).numpy()
 

@@ -153,3 +153,14 @@ CVVP_SWEEPS["v6"] = [
     ("S_rand_g0.3_sig12", dict(**_CKS, clock_sigma=12.0), dict(**_R, z_gain=0.3), 1),
     ("S_rand_g0.3_f3", dict(**dict(_CKS, I=3, clock_freqs=(1.0, 0.5, 2.0))), dict(**_R, z_gain=0.3), 1),
 ]
+
+# -- v7: can a TRAINED programmer be made harmless?  (programming starts small: prog_gain 0.1) --------------------------
+_CKP = dict(**_CK, prog_gain=0.1)
+_SK3 = dict(skip=True, lam=0.03, z_gain=0.3, learn_gain=True)
+CVVP_SWEEPS["v7"] = [
+    ("P_t30_lr3e-3", dict(**_CKP), dict(steps=30, lr=3e-3, **_SK3), 1),
+    ("P_t60_lr1e-3", dict(**_CKP), dict(steps=60, lr=1e-3, **_SK3), 1),
+    ("P_t60_lr3e-3_fwd", dict(**_CKP), dict(steps=60, lr=3e-3, scheme="forward", **_SK3), 1),
+    ("S_t60_lr1e-2", dict(**_CKS), dict(steps=60, lr=1e-2, **_SK3), 1),
+    ("S_t60_lr1e-2_sig12", dict(**_CKS, clock_sigma=12.0), dict(steps=60, lr=1e-2, **_SK3), 1),
+]

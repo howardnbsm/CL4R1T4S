@@ -60,24 +60,33 @@ GAIN_GRID = np.linspace(0.0, 1.5, 151)
 
 _BASE = dict(O=16, I=8, theta0=True)
 _FWD = dict(steps=60, scheme="forward")
+# clock-queried fast programmer: I = 2 query frequencies of the cycle clock, O = 4 outputs, one re-uploading layer
+_CLK = dict(query="clock", O=4, I=2, reps=1, q=6, h=8, theta0=True)
+_SKIP = dict(skip=True, lam=0.03, z_gain=0.3)
+_CLK_T = dict(steps=60, lr=1e-2, learn_gain=True, **_SKIP)
 
 # name -> (model overrides, cvvp overrides, ensemble members)
 CANDIDATES = {
-    # recommended: QKAN slow programmer -> gated fast weights -> programmed QKAN fast programmer -> ridge read-out
+    # RECOMMENDED: closed-form linear part (11 recent annual means) + QKAN layer on the cycle clock (static angles,
+    # trained by CVVP), joint ridge read-out
+    "clock": (dict(**_CLK, program=False), dict(**_CLK_T), 1),
+    "clock_rand": (dict(**_CLK, program=False), dict(steps=0, **_SKIP), 1),          # same, angles left at their random init
+    # in-family variant: the angles of the clock layer are FAST WEIGHTS written by the QKAN slow programmer (gated fold)
+    "clock_fwp": (dict(**_CLK, prog_gain=0.1), dict(steps=30, lr=3e-3, learn_gain=True, **_SKIP), 1),
+    "clock_fwp_rand": (dict(**_CLK, prog_gain=0.1), dict(steps=0, **_SKIP), 1),
+    "clock_fwp_strong": (dict(**_CLK), dict(**_CLK_T), 1),                            # programming at full strength
+    # QKAN ablations of the recommended model
+    "clock_linear": (dict(**_CLK, program=False, fast="linear"), dict(**_CLK_T), 1),  # DARUAN -> linear map of the clock
+    "ridge11": (dict(), dict(lam=0.03), 1),                                           # QKAN layer removed
+    # earlier design: pure QKAN-FWP features (no linear skip), 2-member ensemble, and its ablations
     "rec": (dict(**_BASE), dict(**_FWD), 2),
-    # variants of the training of the programmer
     "rec_rand": (dict(**_BASE), dict(steps=0), 2),
-    "rec_two_sided": (dict(**_BASE), dict(steps=60), 2),
-    "rec_single": (dict(**_BASE), dict(**_FWD), 1),
-    # QKAN ablations (same procedure, QKAN layers replaced / removed)
     "abl_linear_both": (dict(**_BASE, slow="linear", fast="linear"), dict(**_FWD), 2),
     "abl_fast_linear": (dict(**_BASE, fast="linear"), dict(**_FWD), 2),
     "abl_slow_linear": (dict(**_BASE, slow="linear"), dict(**_FWD), 2),
     "abl_no_program": (dict(**_BASE, program=False), dict(**_FWD), 2),
-    # no QKAN and no fast weights at all: closed-form ridge on the 11 recent 12-month means
-    "ridge11": (dict(), dict(lam=0.03), 1),
 }
-RECOMMENDED = "rec"
+RECOMMENDED = "clock"
 
 
 def bump_calibrate(pred: np.ndarray, gain: float, sigma: float = SIGMA_MONTHS) -> np.ndarray:
